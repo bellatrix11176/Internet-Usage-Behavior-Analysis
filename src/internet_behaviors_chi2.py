@@ -5,11 +5,15 @@ Goal:
 - Compute chi-square association between each predictor and the target label
   (Online_Shopping), producing a ranked "attribute weights" table.
 
-Outputs (recreated every run):
-- outputs/internet_behaviors_deidentified_clean.csv
-- outputs/chi2_attribute_weights.csv
-- outputs/chi2_attribute_weights.png
-- outputs/results_summary.txt
+Data Integrity:
+- Invalid sentinel codes (e.g., 99) are treated as MISSING and excluded from
+  chi-square contingency tables (so they never influence weights).
+
+Outputs (recreated every run in <repo_root>/outputs):
+- internet_behaviors_deidentified_clean.csv
+- chi2_attribute_weights.csv
+- chi2_attribute_weights.png
+- results_summary.txt
 
 Notes:
 - Chi-square requires categorical variables. Numeric features are discretized
@@ -30,22 +34,16 @@ import matplotlib.pyplot as plt
 
 
 # =========================
-# PATHS (GITHUB-SAFE)
+# SETTINGS
 # =========================
-# Repo root = one level up from /src
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-DEFAULT_DATA_PATH = REPO_ROOT / "data" / "Internet-Behaviors.csv"
-OUTPUT_DIR = REPO_ROOT / "outputs"
-
-
-# =========================
-# SETTINGS (EDIT THESE IF NEEDED)
-# =========================
-LABEL_COL = "Online_Shopping"  # target used for Chi2 weighting
+LABEL_COL = "Online_Shopping"
 
 POSITIVE_LABELS = {"yes", "y", "1", "true", "t"}
 NEGATIVE_LABELS = {"no", "n", "0", "false", "f"}
+
+# Common invalid/sentinel tokens that should NOT be treated as real data.
+# (Add more here if your dataset uses other codes.)
+INVALID_TOKENS = {"99", "98", "-1", "na", "n/a", "null", "none", ""}
 
 # Predictors included in the chi-square weighting run
 PREDICTOR_COLS = [
@@ -72,24 +70,111 @@ SENSITIVE_COLS = [
 NUMERIC_BINS = 4
 PVALUE_WEAK_THRESHOLD = 0.20
 
+DEFAULT_DATA_REL = Path("data") / "Internet-Behaviors.csv"
+OUTPUTS_REL = Path("outputs")
+
 
 # =========================
-# HELPERS
+# PATH HELPERS (GITHUB-SAFE)
 # =========================
-def ensure_dirs() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def find_repo_root(start: Path) -> Path:
+    """
+    Find the repository root by walking upward from this script.
+    We consider a folder the 'root' if it contains a 'data' folder,
+    or a README.md, or pyproject.toml.
+    """
+    start = start.resolve()
+    candidates = [start] + list(start.parents)
+
+    for p in candidates:
+        if (p / "data").exists() and (p / "data").is_dir():
+            return p
+        if (p / "README.md").exists():
+            return p
+        if (p / "pyproject.toml").exists():
+            return p
+
+    # Fallback: parent of the script directory
+    return start.parent
+
+
+def resolve_data_path(repo_root: Path, user_path: str | None) -> Path:
+    """
+    Resolve dataset path in a way that works anywhere:
+    - If user provides --data, use it (absolute or relative to current working dir).
+    - Else use <repo_root>/data/Internet-Behaviors.csv.
+    - If that doesn't exist, try: <repo_root>/data/*.csv if exactly one is present.
+    """
+    if user_path:
+        p = Path(user_path).expanduser()
+        if not p.is_absolute():
+            p = (Path.cwd() / p).resolve()
+        if p.exists():
+            return p
+        raise FileNotFoundError(
+            f"Cannot find dataset at:\n  {p}\n\n"
+            "Fix options:\n"
+            "1) Double-check the path you passed to --data\n"
+            "2) Or move the dataset into the repo's /data folder\n"
+        )
+
+    # Default location inside repo
+    default_path = (repo_root / DEFAULT_DATA_REL).resolve()
+    if default_path.exists():
+        return default_path
+
+    # Helpful fallback: if /data exists and has exactly one CSV, use it
+    data_dir = repo_root / "data"
+    if data_dir.exists() and data_dir.is_dir():
+        csvs = list(data_dir.glob("*.csv"))
+        if len(csvs) == 1:
+            return csvs[0].resolve()
+
+    raise FileNotFoundError(
+        "Cannot find dataset.\n\n"
+        f"Repo root:\n  {repo_root}\n\n"
+        f"Expected default:\n  {default_path}\n\n"
+        "Fix options:\n"
+        "1) Put your CSV into: <repo_root>/data/\n"
+        "2) Or run with: python src/internet_behaviors_chi2.py --data path/to/yourfile.csv\n"
+    )
+
+
+def ensure_dirs(outputs_dir: Path) -> None:
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+
+# =========================
+# DATA CLEANING / PREP
+# =========================
+def minimal_cleaning(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Light cleaning:
+    - Strip whitespace from strings
+    - Do not aggressively drop rows
+    """
+    out = df.copy()
+    for col in out.columns:
+        if out[col].dtype == "object":
+            out[col] = out[col].astype(str).str.strip()
+    return out
 
 
 def normalize_yes_no(series: pd.Series) -> pd.Series:
     """
     Normalize common Yes/No formats to 1/0 Int64.
+    Invalid tokens become <NA>.
     """
     s = series.astype(str).str.strip().str.lower()
-    out = pd.Series(np.nan, index=series.index, dtype="float64")
 
+    # Convert invalid tokens to NaN
+    s = s.where(~s.isin(INVALID_TOKENS), other=np.nan)
+
+    out = pd.Series(np.nan, index=series.index, dtype="float64")
     out[s.isin(POSITIVE_LABELS)] = 1
     out[s.isin(NEGATIVE_LABELS)] = 0
 
+    # If some values are numeric 0/1 already
     if out.isna().any():
         numeric = pd.to_numeric(series, errors="coerce")
         numeric = numeric.where(numeric.isin([0, 1]))
@@ -112,7 +197,13 @@ def safe_category(series: pd.Series) -> pd.Series:
 def discretize_numeric(series: pd.Series, bins: int = 4) -> pd.Series:
     """
     Discretize numeric series into equal-frequency bins (qcut).
+    Invalid tokens become NaN and are excluded by crosstab/dropna.
     """
+    # Replace invalid tokens if series is object-like
+    if series.dtype == "object":
+        s_str = series.astype(str).str.strip().str.lower()
+        series = series.where(~s_str.isin(INVALID_TOKENS), other=np.nan)
+
     s = pd.to_numeric(series, errors="coerce")
 
     if s.dropna().nunique() <= 1:
@@ -126,30 +217,58 @@ def discretize_numeric(series: pd.Series, bins: int = 4) -> pd.Series:
     return binned.astype("category")
 
 
-def minimal_cleaning(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_feature_to_category(series: pd.Series) -> pd.Series:
     """
-    Light cleaning:
-    - Trim strings
-    - Avoid aggressive dropping
+    Normalize a feature for chi-square:
+    - Convert invalid tokens (e.g., 99) to NaN
+    - If values look yes/no-ish => map to Yes/No category
+    - Else keep as categorical
     """
-    out = df.copy()
-    for col in out.columns:
-        if out[col].dtype == "object":
-            out[col] = out[col].astype(str).str.strip()
-    return out
+    if series.dtype == "object":
+        s = series.astype(str).str.strip().str.lower()
+        s = s.where(~s.isin(INVALID_TOKENS), other=np.nan)
+
+        mapped = s.map({
+            "yes": "Yes", "y": "Yes", "1": "Yes", "true": "Yes", "t": "Yes",
+            "no": "No", "n": "No", "0": "No", "false": "No", "f": "No",
+        })
+
+        # If mapping worked for at least some rows, use it; keep the rest as original strings
+        if mapped.notna().any():
+            out = mapped
+        else:
+            out = s
+
+        return out.astype("category")
+
+    # Numeric/bool columns: treat invalid sentinel 99 as NaN if present
+    s_num = pd.to_numeric(series, errors="coerce")
+    s_num = s_num.where(~s_num.isin([99, 98, -1]), other=np.nan)
+    return s_num.astype("category")
 
 
+# =========================
+# CHI-SQUARE
+# =========================
 def compute_chi2_weight(df: pd.DataFrame, feature: str, label: str) -> dict:
     """
     Chi-square test between feature and label using contingency table.
+    NaNs are excluded so invalid tokens never influence chi2.
     """
-    contingency = pd.crosstab(df[feature], df[label])
+    tmp = df[[feature, label]].dropna()
+    contingency = pd.crosstab(tmp[feature], tmp[label])
 
     if contingency.shape[0] < 2 or contingency.shape[1] < 2:
-        return {"attribute": feature, "chi2": 0.0, "p_value": 1.0, "dof": 0}
+        return {"attribute": feature, "chi2": 0.0, "p_value": 1.0, "dof": 0, "n_used": int(len(tmp))}
 
     chi2, p, dof, _ = chi2_contingency(contingency)
-    return {"attribute": feature, "chi2": float(chi2), "p_value": float(p), "dof": int(dof)}
+    return {
+        "attribute": feature,
+        "chi2": float(chi2),
+        "p_value": float(p),
+        "dof": int(dof),
+        "n_used": int(len(tmp)),
+    }
 
 
 def save_bar_chart(weights_df: pd.DataFrame, out_path: Path) -> None:
@@ -176,7 +295,7 @@ def write_summary(weights_df: pd.DataFrame, out_path: Path) -> None:
 
     lines = []
     lines.append("Internet Behaviors — Chi-Square Feature Association Summary")
-    lines.append("=" * 60)
+    lines.append("=" * 66)
     lines.append("")
     lines.append(f"Label (target): {LABEL_COL} (normalized to 0/1)")
     lines.append("")
@@ -184,77 +303,50 @@ def write_summary(weights_df: pd.DataFrame, out_path: Path) -> None:
     lines.append("- Higher chi2 => stronger association with the label (not causation).")
     lines.append("- Lower p-value => stronger evidence the association is not random.")
     lines.append("- High p-value (near 1.0) => weak/no evidence the feature matters here.")
+    lines.append("- Invalid sentinel values (e.g., 99) were treated as missing and excluded.")
     lines.append("")
 
     lines.append("Ranked results (highest to lowest chi2):")
     for _, r in top.iterrows():
-        lines.append(f"  - {r['attribute']}: chi2={r['chi2']:.3f}, p={r['p_value']:.3f}, dof={int(r['dof'])}")
-    lines.append("")
+        lines.append(
+            f"  - {r['attribute']}: chi2={r['chi2']:.3f}, p={r['p_value']:.3f}, dof={int(r['dof'])}, n_used={int(r['n_used'])}"
+        )
 
+    lines.append("")
     weak = top[top["p_value"] >= PVALUE_WEAK_THRESHOLD]
     lines.append(f"Weak-evidence features (p >= {PVALUE_WEAK_THRESHOLD:.2f}): {len(weak)}")
     if len(weak) > 0:
         lines.append("These should not be over-trusted as important predictors in this dataset.")
-    lines.append("")
 
     out_path.write_text("\n".join(lines), encoding="utf-8")
-
-
-def resolve_data_path(user_path: str | None) -> Path:
-    """
-    Resolve dataset path:
-    - If user passes --data, use it
-    - Else use repo-root data/Internet-Behaviors.csv
-    - Provide helpful fallback if a single CSV exists in repo-root /data
-    """
-    if user_path:
-        path = Path(user_path).expanduser()
-        if path.exists():
-            return path
-
-        raise FileNotFoundError(
-            f"Cannot find dataset at:\n  {path.resolve()}\n\n"
-            "Fix options:\n"
-            "1) Provide the correct path via --data\n"
-            "2) Or place the CSV in the repo's /data folder\n"
-        )
-
-    # Default location (repo root /data)
-    path = DEFAULT_DATA_PATH
-    if path.exists():
-        return path
-
-    # Fallback: if exactly one CSV exists in /data, use it
-    data_dir = REPO_ROOT / "data"
-    if data_dir.exists():
-        csvs = list(data_dir.glob("*.csv"))
-        if len(csvs) == 1:
-            return csvs[0]
-
-    raise FileNotFoundError(
-        "Cannot find dataset.\n\n"
-        f"Expected default path:\n  {path}\n\n"
-        "Fix options:\n"
-        "1) Put your CSV into the repo's /data folder (recommended)\n"
-        "2) Or run with:\n"
-        "   python src/internet_behaviors_chi2.py --data path/to/yourfile.csv\n"
-    )
 
 
 # =========================
 # MAIN
 # =========================
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Chi-square feature association weights for Internet Behaviors.")
-    parser.add_argument("--data", type=str, default=None, help="Path to dataset CSV (defaults to data/Internet-Behaviors.csv)")
+    parser = argparse.ArgumentParser(
+        description="Chi-square feature association weights for Internet Behaviors."
+    )
+    parser.add_argument(
+        "--data",
+        type=str,
+        default=None,
+        help="Path to dataset CSV (defaults to repo_root/data/Internet-Behaviors.csv)",
+    )
     args = parser.parse_args()
 
-    ensure_dirs()
+    # Locate repo root from script location, NOT from where you launched python
+    script_dir = Path(__file__).resolve().parent
+    repo_root = find_repo_root(script_dir)
 
-    data_path = resolve_data_path(args.data)
-    print(f"✅ Repo root:\n{REPO_ROOT}\n")
-    print(f"✅ Using dataset:\n{data_path.resolve()}\n")
-    print(f"✅ Writing outputs to:\n{OUTPUT_DIR.resolve()}\n")
+    outputs_dir = (repo_root / OUTPUTS_REL).resolve()
+    ensure_dirs(outputs_dir)
+
+    data_path = resolve_data_path(repo_root, args.data)
+    print(f"✅ Repo root:\n{repo_root}\n")
+    print(f"✅ Using dataset:\n{data_path}\n")
+    print(f"✅ Outputs dir:\n{outputs_dir}\n")
 
     df = pd.read_csv(data_path)
     df = minimal_cleaning(df)
@@ -266,7 +358,7 @@ def main() -> None:
             f"Available columns: {list(df.columns)}"
         )
 
-    # Normalize label to 0/1 and drop rows where label is missing
+    # Normalize label and drop missing label rows
     df[LABEL_COL] = normalize_yes_no(df[LABEL_COL])
     df = df.dropna(subset=[LABEL_COL]).copy()
 
@@ -279,58 +371,41 @@ def main() -> None:
             "If your column names differ, update PREDICTOR_COLS in the script."
         )
 
-    # Build analysis frame: label + predictors
+    # Build analysis frame
     work = df[[LABEL_COL] + PREDICTOR_COLS].copy()
 
-    # Prepare predictors:
-    # - numeric -> discretize
-    # - yes/no-ish -> category
+    # Prepare predictors for chi-square
     for col in PREDICTOR_COLS:
         if col in ("Hours_Per_Day", "Years_on_Internet"):
             work[col] = discretize_numeric(work[col], bins=NUMERIC_BINS)
         else:
-            if work[col].dtype == "object":
-                s = work[col].astype(str).str.strip().str.lower()
-                mapped = s.map({
-                    "yes": "Yes", "y": "Yes", "1": "Yes", "true": "Yes",
-                    "no": "No", "n": "No", "0": "No", "false": "No"
-                })
-                if mapped.notna().any():
-                    work[col] = mapped.fillna(work[col].astype(str)).astype("category")
-                else:
-                    work[col] = safe_category(work[col])
-            else:
-                work[col] = safe_category(work[col])
+            work[col] = normalize_feature_to_category(work[col])
 
-    # Label as category
+    # Label categorical
     work[LABEL_COL] = work[LABEL_COL].astype(int).astype("category")
 
-    # =========================
-    # CHI-SQUARE WEIGHTS
-    # =========================
+    # Compute chi-square weights
     results = [compute_chi2_weight(work, feature, LABEL_COL) for feature in PREDICTOR_COLS]
     weights_df = pd.DataFrame(results).sort_values("chi2", ascending=False)
 
-    # Save weights
-    out_weights_csv = OUTPUT_DIR / "chi2_attribute_weights.csv"
+    # Save weights table
+    out_weights_csv = outputs_dir / "chi2_attribute_weights.csv"
     weights_df.to_csv(out_weights_csv, index=False)
 
     # Save chart
-    out_chart = OUTPUT_DIR / "chi2_attribute_weights.png"
+    out_chart = outputs_dir / "chi2_attribute_weights.png"
     save_bar_chart(weights_df, out_chart)
 
-    # =========================
-    # DE-IDENTIFIED CLEAN EXPORT
-    # =========================
+    # De-identified dataset export (remove sensitive columns)
     deid = df.copy()
     drop_cols = [c for c in SENSITIVE_COLS if c in deid.columns]
     deid = deid.drop(columns=drop_cols, errors="ignore")
 
-    out_clean_csv = OUTPUT_DIR / "internet_behaviors_deidentified_clean.csv"
+    out_clean_csv = outputs_dir / "internet_behaviors_deidentified_clean.csv"
     deid.to_csv(out_clean_csv, index=False)
 
     # Summary
-    out_summary = OUTPUT_DIR / "results_summary.txt"
+    out_summary = outputs_dir / "results_summary.txt"
     write_summary(weights_df, out_summary)
 
     # Console preview
