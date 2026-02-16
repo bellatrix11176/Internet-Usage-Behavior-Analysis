@@ -86,3 +86,6 @@ Each run recreates the following files in the `outputs/` directory:
 
 ```bash
 python src/internet_behaviors_chi2.py
+```
+🌐 **PixelKraze Analytics (Portfolio):** https://pixelkraze.com/?utm_source=github&utm_medium=readme&utm_campaign=portfolio&utm_content=homepage
+
